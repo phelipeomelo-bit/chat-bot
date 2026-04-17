@@ -1,1 +1,3 @@
-flask
+flaskflask
+psycopg2-binary
+matplotlib

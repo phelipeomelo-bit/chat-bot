@@ -1,115 +1,175 @@
-from flask import Flask, request, Response
+from flask import Flask, request, Response, send_file
 import datetime
+import psycopg2
+import os
+import re
+import matplotlib.pyplot as plt
+from io import BytesIO
 
 app = Flask(__name__)
 
-ARQUIVO = "gastos.txt"
+# ☁️ CONEXÃO POSTGRESQL
+conn = psycopg2.connect(os.environ.get("DATABASE_URL"))
+cursor = conn.cursor()
 
-def salvar_gasto(texto):
-    try:
-        texto = texto.lower().strip()
-        hoje = datetime.datetime.now()
-        mes_atual = hoje.strftime("%m/%Y")
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS gastos (
+    id SERIAL PRIMARY KEY,
+    data TEXT,
+    descricao TEXT,
+    valor REAL,
+    categoria TEXT
+)
+""")
+conn.commit()
 
-        # 🗑 APAGAR TUDO
-        if texto == "apagar tudo":
-            open(ARQUIVO, "w").close()
-            return "🗑 Histórico apagado!"
+# 🤖 CATEGORIZAÇÃO
+def categorizar(desc):
+    if "ifood" in desc or "almoço" in desc:
+        return "alimentacao"
+    if "uber" in desc or "onibus" in desc:
+        return "transporte"
+    if "netflix" in desc:
+        return "lazer"
+    return "outros"
 
-        # 📅 APAGAR SÓ O MÊS ATUAL
-        elif texto == "limpar mes":
-            novas_linhas = []
+# 🤖 IA SIMPLES
+def interpretar(texto):
+    texto = texto.lower()
 
-            try:
-                with open(ARQUIVO, "r") as f:
-                    for linha in f:
-                        data, desc, valor = linha.strip().split(" | ")
+    match = re.search(r'(\d+[.,]?\d*)', texto)
+    if not match:
+        return None
 
-                        if mes_atual not in data:
-                            novas_linhas.append(linha)
+    valor = float(match.group(1).replace(",", "."))
 
-                with open(ARQUIVO, "w") as f:
-                    f.writelines(novas_linhas)
+    if "ontem" in texto:
+        data = datetime.datetime.now() - datetime.timedelta(days=1)
+    else:
+        data = datetime.datetime.now()
 
-                return "📅 Gastos do mês atual apagados!"
+    descricao = texto
+    categoria = categorizar(texto)
 
-            except FileNotFoundError:
-                return "Nenhum gasto encontrado."
+    return descricao, valor, data, categoria
 
-        # 📤 EXPORTAR HISTÓRICO
-        elif texto == "exportar":
-            try:
-                with open(ARQUIVO, "r") as f:
-                    dados = f.read()
+# 💾 SALVAR / COMANDOS
+def processar(texto):
+    texto = texto.lower().strip()
+    hoje = datetime.datetime.now()
+    data_str = hoje.strftime("%d/%m/%Y")
+    mes_atual = hoje.strftime("%m/%Y")
 
-                if not dados:
-                    return "Nenhum gasto registrado."
+    # 📊 TOTAL
+    if texto == "total":
+        cursor.execute("SELECT SUM(valor) FROM gastos WHERE data LIKE %s", (f"%/{mes_atual}",))
+        total = cursor.fetchone()[0] or 0
+        return f"💰 Total do mês: R${total:.2f}"
 
-                return f"📤 Histórico:\n\n{dados}"
+    # 📊 RESUMO
+    if texto == "resumo":
+        cursor.execute("SELECT SUM(valor) FROM gastos WHERE data LIKE %s", (f"%/{mes_atual}",))
+        total = cursor.fetchone()[0] or 0
 
-            except FileNotFoundError:
-                return "Nenhum gasto registrado."
+        cursor.execute("""
+        SELECT categoria, SUM(valor)
+        FROM gastos
+        WHERE data LIKE %s
+        GROUP BY categoria
+        """, (f"%/{mes_atual}",))
 
-        # 💰 TOTAL DO MÊS
-        elif texto == "total":
-            total = 0
+        dados = cursor.fetchall()
 
-            try:
-                with open(ARQUIVO, "r") as f:
-                    for linha in f:
-                        data, desc, valor = linha.strip().split(" | ")
+        resp = f"📊 Resumo do mês:\n\n💰 Total: R${total:.2f}\n"
+        for cat, val in dados:
+            resp += f"{cat}: R${val:.2f}\n"
 
-                        if mes_atual in data:
-                            total += float(valor)
+        return resp
 
-                return f"💰 Total do mês: R${total:.2f}"
+    # 📤 EXPORTAR
+    if texto == "exportar":
+        cursor.execute("SELECT data, descricao, valor FROM gastos ORDER BY id DESC LIMIT 20")
+        dados = cursor.fetchall()
 
-            except FileNotFoundError:
-                return "Nenhum gasto ainda."
+        resp = "📤 Últimos gastos:\n\n"
+        for d in dados:
+            resp += f"{d[0]} | {d[1]} | R${d[2]:.2f}\n"
 
-        # 💸 SALVAR GASTO
-        partes = texto.split()
+        return resp
 
-        if len(partes) < 2:
-            return "❌ Use: mercado 30"
+    # 🗑 LIMPAR
+    if texto == "apagar tudo":
+        cursor.execute("DELETE FROM gastos")
+        conn.commit()
+        return "🗑 Tudo apagado!"
 
-        descricao = partes[0]
-        valor = float(partes[1].replace(",", "."))
+    # 🤖 INTERPRETAÇÃO
+    interpretado = interpretar(texto)
 
-        data = hoje.strftime("%d/%m/%Y")
+    if interpretado:
+        desc, valor, data_obj, categoria = interpretado
+        data_formatada = data_obj.strftime("%d/%m/%Y")
 
-        with open(ARQUIVO, "a") as f:
-            f.write(f"{data} | {descricao} | {valor}\n")
+        cursor.execute(
+            "INSERT INTO gastos (data, descricao, valor, categoria) VALUES (%s, %s, %s, %s)",
+            (data_formatada, desc, valor, categoria)
+        )
+        conn.commit()
 
-        return f"✅ Anotado PH!\n{descricao} - R${valor}"
+        # 🔔 ALERTA
+        cursor.execute("SELECT SUM(valor) FROM gastos WHERE data = %s", (data_formatada,))
+        total_dia = cursor.fetchone()[0] or 0
 
-    except Exception as e:
-        return f"Erro: {e}"
+        resp = f"✅ R${valor:.2f} ({categoria})"
 
+        if total_dia > 100:
+            resp += f"\n⚠️ Hoje já gastou R${total_dia:.2f}"
 
-# 🔥 ROTA PRINCIPAL DO TWILIO (CORRIGIDA)
+        return resp
+
+    return "❌ Não entendi. Ex: 'ifood 30' ou 'gastei 20 ontem'"
+
+# 🔥 WEBHOOK TWILIO
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    mensagem = request.form.get("Body")
-
-    resposta = salvar_gasto(mensagem)
+    msg = request.form.get("Body")
+    resp = processar(msg)
 
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Message>{resposta}</Message>
+<Message>{resp}</Message>
 </Response>"""
 
     return Response(xml, mimetype="application/xml")
 
+# 📈 GRÁFICO
+@app.route("/grafico")
+def grafico():
+    hoje = datetime.datetime.now()
+    mes_atual = hoje.strftime("%m/%Y")
 
-# 👀 TESTE NO NAVEGADOR
+    cursor.execute("""
+    SELECT categoria, SUM(valor)
+    FROM gastos
+    WHERE data LIKE %s
+    GROUP BY categoria
+    """, (f"%/{mes_atual}",))
+
+    dados = cursor.fetchall()
+
+    categorias = [d[0] for d in dados]
+    valores = [float(d[1]) for d in dados]
+
+    plt.figure()
+    plt.pie(valores, labels=categorias, autopct='%1.1f%%')
+
+    img = BytesIO()
+    plt.savefig(img, format='png')
+    img.seek(0)
+
+    return send_file(img, mimetype='image/png')
+
+# 👀 HOME
 @app.route("/")
 def home():
-    return "🤖 Bot rodando 24h com sucesso, PH!"
-
-
-import os
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    return "🤖 BOT FINANCEIRO PROFISSIONAL ONLINE"
