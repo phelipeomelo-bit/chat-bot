@@ -1,4 +1,4 @@
-from flask import Flask, request
+from flask import Flask, request, Response
 import datetime
 
 app = Flask(__name__)
@@ -86,17 +86,27 @@ def salvar_gasto(texto):
     except Exception as e:
         return f"Erro: {e}"
 
+
+# 🔥 ROTA PRINCIPAL DO TWILIO (CORRIGIDA)
 @app.route("/webhook", methods=["POST"])
 def webhook():
     mensagem = request.form.get("Body")
 
     resposta = salvar_gasto(mensagem)
 
-    return f"""
-    <Response>
-        <Message>{resposta}</Message>
-    </Response>
-    """
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Message>{resposta}</Message>
+</Response>"""
+
+    return Response(xml, mimetype="application/xml")
+
+
+# 👀 TESTE NO NAVEGADOR
+@app.route("/")
+def home():
+    return "🤖 Bot rodando 24h com sucesso, PH!"
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
